@@ -35,6 +35,53 @@ MiniMax H3 Adaptive Cache
 
 `examples/video_minimax_h3_i2v_adaptive_cache.json` 已根据本次提供的 I2V 工作流改好，可直接加载。
 
+### 与 Kijai Sol-Attn 组合
+
+本插件可以和 [`kijai/ComfyUI-SolAttn_triton`](https://github.com/kijai/ComfyUI-SolAttn_triton) 同时使用。推荐顺序：
+
+```text
+UNETLoader
+   ↓
+Patch Sol-Attn
+   ↓
+MiniMax H3 Adaptive Cache
+   ├─→ BasicScheduler
+   └─→ BasicGuider / CFGGuider
+```
+
+Sol-Attn 负责降低实际执行 Block 内的 Attention 成本，Adaptive Cache 负责跳过满足条件的尾部 Block，两者优化层级不同。
+
+组合时必须关闭 Sol-Attn 的 Morton 重排：
+
+```text
+morton = false
+```
+
+Morton 会在 Block 栈前重排目标视频 token，并在最后一个 Block 后恢复顺序。缓存命中会跳过尾部 Block，不能依赖这个恢复点；完整缓存捕获也不能把 Morton 顺序的 warm state 与恢复顺序后的 final state 相减。
+
+从 `0.1.1` 起，插件会读取 `transformer_options["sol_morton"]`：
+
+- Morton 关闭：Sol-Attn 与 Adaptive Cache 正常叠加；
+- Morton 开启：Adaptive Cache 自动旁路，完整执行全部 DiT Block，Sol-Attn 继续工作；
+- 旁路期间不会捕获或复用 residual，控制台会给出一次警告和调用统计；
+- 不需要导入或依赖 Kijai 插件的任何私有 Python 模块。
+
+第一轮组合测试建议：
+
+```text
+Sol-Attn:
+  morton = false
+  use_tma = false
+  int8_qk = false
+  sink_conditioning = exact_kv
+
+Adaptive Cache:
+  preset = balanced
+  cache_device = auto
+```
+
+确认 BF16 Sol-Attn 组合质量后，再单独测试 `int8_qk=true`。一次同时打开多种近似，然后盯着融化的手指猜凶手，通常不会产生可靠结论。
+
 ## 预设
 
 | 预设 | 最多缓存的尾部 Block | 缓存窗口 | 连续缓存上限 | 内容保护 |
@@ -117,6 +164,8 @@ mean(abs(current - previous))
 
 以上是按执行层数和 H3 权重流式加载结构推算的工程区间，不是当前包在 RTX 5080 上完成的实测成绩。本开发环境没有 H3 权重与 CUDA GPU，因此只完成 CPU 逻辑、节点注册和预取守卫测试。需要在真实 ComfyUI 环境中做固定 seed 的官方节点对照测试。
 
+Sol-Attn 与 Adaptive Cache 的组合收益不会简单相乘。Adaptive Cache 已跳过的 Block 不再产生 Attention 工作量，Sol-Attn 只会继续加速实际执行的前部 Block 和完整刷新调用。物理规律对此没有协商空间。
+
 ## 控制台统计
 
 一次采样结束后，插件按条件通道打印：
@@ -127,7 +176,8 @@ mean(abs(current - previous))
 - 内容保护拒绝次数；
 - 平均内容变化量；
 - 插件包围的模型调用耗时；
-- residual 最终存放位置。
+- residual 最终存放位置；
+- Sol-Attn Morton 导致的安全旁路调用数。
 
 `block reduction` 不是总工作流速度提升。Qwen 编码、VAE 解码、视频封装和必须执行的前部 Block 仍然存在，宇宙没有突然开始发放免费算力。
 
@@ -157,7 +207,7 @@ mean(abs(current - previous))
 
 当前实现依据 ComfyUI 的 MiniMax H3 支持版本编写。若未来 ComfyUI 改变这些内部接口，插件会明确报错，而不是礼貌地显示“已加速”然后什么都没做。
 
-不建议与其他会替换 MiniMax H3 `double_block` 的缓存、跳层或 Block Patch 节点叠加。相同扩展点只能有一套最终实现，节点堆叠并不会形成复利。
+可以与使用 `optimized_attention_override` 的 Attention 后端组合，包括 Kijai Sol-Attn。Sol-Attn 的 Morton 模式会被自动识别并安全旁路 Adaptive Cache。其他会替换 MiniMax H3 `double_block` 的缓存、跳层或 Block Patch 节点仍不建议叠加，相同扩展点只能有一套最终实现，节点堆叠并不会形成复利。
 
 ## 测试
 
@@ -175,11 +225,14 @@ python -m unittest discover -s tests -v
 - 内容突变强制完整刷新；
 - 关闭缓存时完整执行；
 - 节点注册 50 个 Block hook 与采样生命周期 hook；
-- 预取守卫阻止被跳过 Block 的预取。
+- 预取守卫阻止被跳过 Block 的预取；
+- Sol-Attn Morton 开启时完整执行全部 Block；
+- Morton 旁路不会保存或复用 residual；
+- 从 Morton 返回正常 token 顺序后强制完整刷新。
 
 ## 版本
 
-当前版本：`0.1.0`
+当前版本：`0.1.1`
 
 ## 许可证
 
