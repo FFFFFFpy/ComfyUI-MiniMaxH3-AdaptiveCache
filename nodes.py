@@ -6,11 +6,13 @@ from typing import Any, Optional
 from .adaptive_cache import (
     AdaptiveCacheSettings,
     AdaptiveTailCacheController,
-    BlockInterceptor,
     PRESETS,
-    SamplingLifecycleWrapper,
 )
 from .runtime_patch import install_prefetch_guard
+from .sol_attn_compat import (
+    SolAttnCompatibleBlockInterceptor,
+    SolAttnCompatibleSamplingLifecycleWrapper,
+)
 
 
 def _find_minimax_dit(model: Any) -> Optional[Any]:
@@ -56,7 +58,7 @@ def _apply_cache_patch(model: Any, settings: AdaptiveCacheSettings, label: str) 
         except Exception:
             pass
         patched.set_model_patch_replace(
-            BlockInterceptor(controller, index),
+            SolAttnCompatibleBlockInterceptor(controller, index),
             "dit",
             "double_block",
             index,
@@ -67,7 +69,7 @@ def _apply_cache_patch(model: Any, settings: AdaptiveCacheSettings, label: str) 
         patched.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
             f"minimax_h3_adaptive_cache_{id(controller)}",
-            SamplingLifecycleWrapper(controller),
+            SolAttnCompatibleSamplingLifecycleWrapper(controller),
         )
     except Exception as exc:
         raise RuntimeError(
@@ -100,7 +102,10 @@ class MiniMaxH3AdaptiveCache:
     RETURN_NAMES = ("model",)
     FUNCTION = "patch"
     CATEGORY = "sampling/custom_sampling/minimax_h3"
-    DESCRIPTION = "Standalone content-aware tail-block cache for native MiniMax H3. No model.py patch is required."
+    DESCRIPTION = (
+        "Standalone content-aware tail-block cache for native MiniMax H3. "
+        "Compatible with Sol-Attn when Morton is disabled; Morton calls are safely bypassed."
+    )
 
     def patch(self, model, preset, cache_device):
         settings = replace(PRESETS[preset], cache_device=cache_device)
@@ -161,7 +166,10 @@ class MiniMaxH3AdaptiveCacheAdvanced:
     RETURN_NAMES = ("model",)
     FUNCTION = "patch"
     CATEGORY = "sampling/custom_sampling/minimax_h3"
-    DESCRIPTION = "Advanced MiniMax H3 adaptive tail-cache controls. This is an approximate, seed-changing acceleration patch."
+    DESCRIPTION = (
+        "Advanced MiniMax H3 adaptive tail-cache controls. This is an approximate, "
+        "seed-changing acceleration patch with automatic Sol-Attn Morton safety bypass."
+    )
 
     def patch(
         self,
