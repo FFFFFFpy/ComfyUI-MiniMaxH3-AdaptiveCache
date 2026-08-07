@@ -159,6 +159,63 @@ mean(abs(current - previous))
 
 这不等于端到端耗时下降 76%。文本编码、VAE、视频封装、完整刷新调用、必须执行的前部 Block、显存调度和磁盘/内存缓存仍会占用时间。
 
+### RTX 5090 组合实测：20 步 / Turbo-4 / Turbo-8
+
+这组测试比下面的 RTX 4090 初测更完整：同一套工作流连续测试 18 种组合，每种配置生成 2 次并取平均。输出为 `1376×768`、124 帧、24 FPS（约 5.17 秒视频）。
+
+测试环境：
+
+- GPU：NVIDIA GeForce RTX 5090 32GB；
+- PyTorch：`2.12.1+cu130`；
+- ComfyUI：`0.30.0`；
+- MiniMax H3 DiT：W4A8 混合量化测试环境；
+- Adaptive Cache：`Balanced`，本轮 residual 落在 GPU；
+- EasyCache：`threshold=0.2, start_percent=0.15, end_percent=0.95`。
+
+| 配置 | 两次总耗时 | 平均 | 相对 20 步原版 |
+|---|---:|---:|---:|
+| 原版 20 步 | 303.72 / 290.91 s | **297.32 s** | 1.00× |
+| Sol-Attn | 184.73 / 176.93 s | **180.83 s** | **1.64×** |
+| Adaptive Cache | 186.36 / 186.11 s | **186.24 s** | **1.60×** |
+| Sol-Attn + Adaptive Cache | 121.98 / 121.79 s | **121.89 s** | **2.44×** |
+| EasyCache | 194.54 / 180.58 s | **187.56 s** | **1.59×** |
+| Sol-Attn + EasyCache | 137.64 / 137.44 s | **137.54 s** | **2.16×** |
+| Turbo-4 | 73.21 / 73.17 s | **73.19 s** | **4.06×** |
+| Sol-Attn + Turbo-4 | 48.53 / 48.71 s | **48.62 s** | **6.12×** |
+| Adaptive Cache + Turbo-4 | 51.08 / 51.57 s | **51.33 s** | **5.79×** |
+| Sol-Attn + Adaptive Cache + Turbo-4 | 39.61 / 39.18 s | **39.40 s** | **7.55×** |
+| EasyCache + Turbo-4 | 73.57 / 73.08 s | **73.33 s** | **4.05×** |
+| Sol-Attn + EasyCache + Turbo-4 | 48.87 / 48.60 s | **48.74 s** | **6.10×** |
+| Turbo-8 | 131.62 / 131.80 s | **131.71 s** | **2.26×** |
+| Sol-Attn + Turbo-8 | 82.41 / 82.17 s | **82.29 s** | **3.61×** |
+| Adaptive Cache + Turbo-8 | 87.71 / 87.42 s | **87.57 s** | **3.40×** |
+| Sol-Attn + Adaptive Cache + Turbo-8 | 56.99 / 57.14 s | **57.07 s** | **5.21×** |
+| EasyCache + Turbo-8 | 131.74 / 131.70 s | **131.72 s** | **2.26×** |
+| Sol-Attn + EasyCache + Turbo-8 | 82.36 / 82.36 s | **82.36 s** | **3.61×** |
+
+这轮数据里有几个比较稳定的结论：
+
+- **Sol-Attn 与 Adaptive Cache 可以有效叠加。** 20 步原版从 297.32 秒降到 121.89 秒；Sol-Attn 降低实际执行 Block 的 Attention 成本，Adaptive Cache 减少实际执行的尾部 Block，优化层级不同。
+- **Adaptive Cache 单独也有明确收益。** 20 步从 297.32 秒降到 186.24 秒，约 1.60×；Balanced 典型统计为 `full=10, cache=10, executed=620/1000 blocks, block reduction=38%`。
+- **Turbo-8 与 Sol-Attn + Adaptive Cache 在性能上仍能继续叠加。** 本轮最快的 Turbo-8 组合为 57.07 秒，相对 20 步原版约 5.21×。
+- **Turbo-4 的极限性能更高。** `Sol-Attn + Adaptive Cache + Turbo-4` 达到 39.40 秒，约 7.55×；但 Turbo 相关画质必须单独评估，不能只看耗时。
+- **EasyCache 在正常 20 步下有效，但在本轮 Turbo-4 / Turbo-8 下没有实际跳步。** 日志分别出现 `skipped 0/4 steps` 与 `skipped 0/8 steps`，加入 EasyCache 后总耗时也与对应 Turbo 基线几乎一致，因此不建议为了 Turbo 组合额外挂 EasyCache。
+
+#### Turbo + W4A8 画质说明
+
+本轮 Turbo 测试使用 W4A8 混合量化环境。部分 Turbo-4 样本出现明显画质异常，尤其在继续叠加缓存近似时更容易暴露，但**当前数据不足以证明 Adaptive Cache 与 Turbo 本身不兼容**。
+
+目前更合理的待验证假设是：Turbo 的少步采样 / LoRA 与 W4A8 量化近似之间存在兼容性或误差放大问题；Adaptive Cache 可能进一步放大已有误差，但未必是根因。要区分这些因素，需要在完全相同 seed、提示词和输入下至少补充 BF16/FP16 或其他量化格式的 Turbo 对照。
+
+因此当前建议是：
+
+- 使用 Turbo 前先单独验证所用量化模型的画质；
+- W4A8 + Turbo 组合暂时视为实验性配置，不把异常直接归因于 Adaptive Cache；
+- 若要评估 Adaptive Cache 与 Turbo 的质量兼容性，应先在非 W4A8 基线下做同 seed A/B；
+- 速度结果可以参考上表，但不能把这组 W4A8 Turbo 样本直接当成通用质量结论。
+
+另外，Turbo 将采样器本身压缩到很短以后，端到端瓶颈开始转向固定开销。以最快的 Turbo 组合为例，sampler 约 23.8 秒，而总工作流约 39.4 秒，说明约 15～16 秒已经来自 VAE、封装和其他前后处理。继续只优化 DiT 的边际收益会越来越小。
+
 ### RTX 4090 初步实测
 
 以下数据来自同一套 MiniMax H3 工作流，分辨率为 `960×640`，单位为秒。它们是实际使用过程中的单次记录，不是严格控制预热、运行顺序和重复次数的正式 benchmark。
@@ -267,6 +324,8 @@ block reduction=38.0%, content rejects=1, residual=gpu
 当前实现依据 ComfyUI 的 MiniMax H3 支持版本编写。若未来 ComfyUI 改变这些内部接口，插件会明确报错。
 
 可以与使用 `optimized_attention_override` 的 Attention 后端组合，包括 Kijai Sol-Attn。Sol-Attn 的 Morton 模式会被自动识别并安全旁路 Adaptive Cache。其他会替换 MiniMax H3 `double_block` 的缓存、跳层或 Block Patch 节点仍不建议叠加，相同扩展点只能有一套最终实现。
+
+Turbo LoRA / Turbo sampler 在执行路径上可以与 Adaptive Cache 同时工作，5090 实测也能继续获得性能叠加；但当前 W4A8 测试中的 Turbo 画质存在未解决变量，暂不把它列为“已验证无损兼容”。质量结论请参考上面的 **Turbo + W4A8 画质说明**。
 
 ## 测试
 
