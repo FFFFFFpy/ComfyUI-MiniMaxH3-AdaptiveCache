@@ -99,6 +99,41 @@ class NodeIntegrationTests(unittest.TestCase):
         self.comfy.model_prefetch.prefetch_queue_pop(queue, None, skipped_block)
         self.assertIsNone(queue[0])
 
+    def test_prefetch_guard_supports_current_two_argument_cleanup(self):
+        plugin = load_plugin_package()
+        cache_module = sys.modules[plugin.__name__ + ".adaptive_cache"]
+        runtime_module = sys.modules[plugin.__name__ + ".runtime_patch"]
+
+        cleaned = []
+
+        def cleanup_prefetched_modules(module, modules):
+            cleaned.append((module, modules))
+
+        self.comfy.model_prefetch.cleanup_prefetched_modules = cleanup_prefetched_modules
+        runtime_module.install_prefetch_guard()
+
+        previous_block = object()
+        skipped_block = object()
+        previous_modules = [object()]
+        skipped_modules = [object()]
+        cache_module.PrefetchSkipContext.set_skipped([id(skipped_block)])
+
+        queue = [
+            (None, (previous_block, previous_modules)),
+            (None, (skipped_block, skipped_modules)),
+            None,
+        ]
+        self.comfy.model_prefetch.prefetch_queue_pop(queue, None, skipped_block)
+
+        self.assertEqual(
+            cleaned,
+            [
+                (previous_block, previous_modules),
+                (skipped_block, skipped_modules),
+            ],
+        )
+        self.assertIsNone(queue[0])
+
     def test_cache_hit_suppresses_tail_prefetch(self):
         import torch
 
