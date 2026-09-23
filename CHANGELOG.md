@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2
+
+- 升级为 prefetch guard v3，保留 `*args/**kwargs` 透传，兼容原生 H3 的 `malloc_scope="block"` 调用。
+- 缓存命中时先调用 ComfyUI 的无队列路径推进分配图作用域，再清理已预取权重，保持原生执行顺序与队列对齐。
+- 携带 `core`、图选项、额外位置参数或未知关键字参数时保守回退原函数，不吞掉回调或扩展行为。
+- 安装检查同时核对实际函数；升级时解开本插件旧 guard，避免旧 marker、嵌套补丁或过期原函数引用阻止修复。
+- 保留第三方函数包装，阻止旧版插件重新覆盖新版 guard，并输出补丁版本和实际加载路径。
+- 保留单参数与双参数 cleanup API 的兼容性；新增 24 项无需 GPU 的独立回归测试。
+- 新增[预取接口兼容与升级说明](docs/prefetch-compatibility.md)。本次不修改缓存算法、节点输入或模型权重。
+
 ## 0.1.1
 
 - 新增 Kijai `ComfyUI-SolAttn_triton` 组合兼容层。
