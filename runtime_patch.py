@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from typing import Any
 
@@ -8,9 +9,39 @@ from .adaptive_cache import PrefetchSkipContext
 
 
 _PATCH_LOCK = threading.Lock()
-_PATCH_MARKER = "_mmh3_adaptive_cache_prefetch_guard_v2"
+_PATCH_MARKER = "_mmh3_adaptive_cache_prefetch_guard_v3"
+_LEGACY_MARKERS = (
+    "_mmh3_adaptive_cache_prefetch_guard_v1",
+    "_mmh3_adaptive_cache_prefetch_guard_v2",
+)
+_INSTALLED_ATTR = "_mmh3_adaptive_cache_installed_prefetch_guard"
 _CALLBACK_MARKER = "_mmh3_adaptive_cache_should_skip"
 _ORIGINAL_ATTR = "_mmh3_adaptive_cache_original_prefetch_queue_pop"
+
+
+def _unwrap_own_guard(function: Any) -> Any:
+    """Remove only this plugin's guards, including legacy closure-only guards."""
+
+    seen = set()
+    while (
+        inspect.isfunction(function)
+        and function.__code__.co_name == "guarded_prefetch_queue_pop"
+        and function.__qualname__.endswith(
+            "install_prefetch_guard.<locals>.guarded_prefetch_queue_pop"
+        )
+    ):
+        if id(function) in seen:
+            raise RuntimeError("Cyclic Adaptive Cache prefetch guards; restart ComfyUI")
+        seen.add(id(function))
+        original = getattr(function, _ORIGINAL_ATTR, None)
+        if original is None:
+            original = inspect.getclosurevars(function).nonlocals.get("original")
+        if not callable(original):
+            # A third-party decorator may have copied our function name.
+            # Do not discard it or replace unrelated plugins with a stale stock ref.
+            break
+        function = original
+    return function
 
 
 def _cleanup_prefetch_state(cleanup: Any, prefetch_state: Any) -> None:
@@ -57,17 +88,17 @@ def install_prefetch_guard() -> None:
         # the callback dynamically, so it never keeps a dead thread-local class
         # from an older module instance.
         setattr(comfy.model_prefetch, _CALLBACK_MARKER, PrefetchSkipContext.should_skip)
-        if getattr(comfy.model_prefetch, _PATCH_MARKER, False):
+        current = comfy.model_prefetch.prefetch_queue_pop
+        if (
+            getattr(comfy.model_prefetch, _PATCH_MARKER, False)
+            and getattr(comfy.model_prefetch, _INSTALLED_ATTR, None) is current
+        ):
             return
 
-        # If an older version of this plugin already installed a guard in the
-        # same Python process, reuse the stored stock ComfyUI function instead
-        # of wrapping the stale guard a second time.
-        original = getattr(
-            comfy.model_prefetch,
-            _ORIGINAL_ATTR,
-            comfy.model_prefetch.prefetch_queue_pop,
-        )
+        # A module-level marker can outlive the function it describes. Recover
+        # directly from the active guard chain, not a possibly stale saved ref.
+        # Unrelated wrappers remain in the call chain.
+        original = _unwrap_own_guard(current)
 
         def guarded_prefetch_queue_pop(
             queue: Any,
@@ -80,6 +111,16 @@ def install_prefetch_guard() -> None:
             if queue is None or should_skip is None or not should_skip(module):
                 return original(queue, device, module, *args, **kwargs)
 
+            # Only specialize the plain prefetch call used by native H3.
+            # Callback/graph calls and future API extensions keep stock behavior
+            # rather than silently losing callbacks or replaying the wrong graph.
+            if args or any(key not in {"dtype", "malloc_scope"} for key in kwargs):
+                return original(queue, device, module, *args, **kwargs)
+
+            # Advance the allocator scope BEFORE releasing prefetched weights,
+            # matching stock ComfyUI's ordering. Its no-queue path does not load
+            # weights. Argument validation also happens before we mutate queue.
+            result = original(None, device, module, **kwargs)
             cleanup = comfy.model_prefetch.cleanup_prefetched_modules
 
             # Consume the previously used module exactly as stock ComfyUI does.
@@ -102,8 +143,16 @@ def install_prefetch_guard() -> None:
                     _cleanup_prefetch_state(cleanup, prefetch_state)
                 queue[0] = None
 
-            return None
+            return result
 
+        setattr(guarded_prefetch_queue_pop, _ORIGINAL_ATTR, original)
         setattr(comfy.model_prefetch, _ORIGINAL_ATTR, original)
         comfy.model_prefetch.prefetch_queue_pop = guarded_prefetch_queue_pop
         setattr(comfy.model_prefetch, _PATCH_MARKER, True)
+        setattr(comfy.model_prefetch, _INSTALLED_ATTR, guarded_prefetch_queue_pop)
+        # Older copies must not reinstall their three-argument guard over v3.
+        for marker in _LEGACY_MARKERS:
+            setattr(comfy.model_prefetch, marker, True)
+        logging.info(
+            "MiniMax H3 Adaptive Cache: prefetch guard v3 installed from %s", __file__
+        )
