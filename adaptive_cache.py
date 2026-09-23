@@ -1,15 +1,49 @@
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
 
 TensorRange = Tuple[int, int]
+
+
+_CACHE_GRAPH_LOCAL = threading.local()
+
+
+def _cache_tensor_operation(function):
+    """Keep plugin-owned tensors out of Comfy's per-block allocation graph.
+
+    Warm snapshots survive a block scope and residuals/probes survive a model
+    forward. Their allocation, copy and release cannot belong to those scopes.
+    Use the same public pause boundary as native H3 FunControl, not a global
+    compiler switch. Original model blocks are deliberately NOT decorated.
+    """
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # Comfy loads model_prefetch before installing our node. Resolve lazily
+        # so standalone CPU tests, older Comfy builds and reloads still work.
+        prefetch = sys.modules.get("comfy.model_prefetch")
+        pause = getattr(prefetch, "pause_malloc_graph", None)
+        if pause is None or getattr(_CACHE_GRAPH_LOCAL, "active", False):
+            return function(*args, **kwargs)
+
+        # AIMDO's pause is a boolean, not a nesting counter. Nested cache
+        # operations must not resume recording until the outer operation ends.
+        _CACHE_GRAPH_LOCAL.active = True
+        try:
+            with pause():
+                return function(*args, **kwargs)
+        finally:
+            _CACHE_GRAPH_LOCAL.active = False
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -222,7 +256,13 @@ class ResidualStore:
             return self.tensors
 
         if self._prefetched is not None and self._event is not None and self._is_cuda(device):
-            torch.cuda.current_stream(device).wait_event(self._event)
+            consumer = torch.cuda.current_stream(device)
+            consumer.wait_event(self._event)
+            # The copy event protects the producer only. The tensor was
+            # allocated on a side stream and must also outlive the consumer's
+            # residual add, even when finish_call drops our Python references.
+            for tensor in self._prefetched:
+                tensor.record_stream(consumer)
             return self._prefetched
         return [t.to(device=device, non_blocking=False) for t in self.tensors]
 
@@ -338,6 +378,7 @@ class AdaptiveTailCacheController:
         self._lanes_lock = threading.Lock()
         self._runtime = threading.local()
 
+    @_cache_tensor_operation
     def start_sampling_run(self) -> None:
         """Start a fresh sampler invocation and discard all stale cache state."""
         PrefetchSkipContext.clear()
@@ -349,6 +390,7 @@ class AdaptiveTailCacheController:
         self._runtime.active_lane = None
         self._runtime.skip_from = None
 
+    @_cache_tensor_operation
     def end_sampling_run(self) -> None:
         """Print honest block statistics and release residual/probe tensors."""
         PrefetchSkipContext.clear()
@@ -515,6 +557,7 @@ class AdaptiveTailCacheController:
         lane.clear_runtime_cache()
         lane.stats = LaneStats()
 
+    @_cache_tensor_operation
     def begin_call(self, args: Dict[str, Any]) -> None:
         PrefetchSkipContext.clear()
         self._runtime.skip_from = None
@@ -563,6 +606,7 @@ class AdaptiveTailCacheController:
         lane.last_position = position
         self._set_active_lane(key, lane)
 
+    @_cache_tensor_operation
     def after_warm(self, hidden: torch.Tensor, args: Dict[str, Any]) -> torch.Tensor:
         lane = self._active_lane()
         if lane is None:
@@ -627,6 +671,7 @@ class AdaptiveTailCacheController:
         skip_from = getattr(self._runtime, "skip_from", None)
         return skip_from is not None and block_index >= skip_from
 
+    @_cache_tensor_operation
     def finish_call(self, hidden: torch.Tensor) -> None:
         lane = self._active_lane()
         if lane is None:
@@ -667,6 +712,7 @@ class AdaptiveTailCacheController:
             self._runtime.skip_from = None
             self._set_active_lane(None, None)
 
+    @_cache_tensor_operation
     def abort_call(self) -> None:
         lane = self._active_lane()
         if lane is not None:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+- 修复缓存张量与 Comfy 分配图的生命周期边界：只在快照、探针、残差操作及清理期间使用公开的 `pause_malloc_graph()`，原始 DiT Block 继续使用编译器。
+- 不修改全局编译器、CUDA Graph 或 DynamicVRAM 开关；旧版无暂停 API 时保持原行为，并为插件内部嵌套暂停提供线程局部保护。
+- 为侧流预取的 residual 补充消费流 `record_stream()`，避免计算尚未完成时提前回收张量。
+- 新增 23 项 CPU 边界回归测试，连同原有 5 项缓存算法测试共 28 项通过；未执行真实 CUDA/H3 生成或性能基准。
+- 新增[编译器兼容说明与本地验收步骤](docs/compiler-compatibility.md)。prefetch guard 保持 v3，缓存参数和 Sol-Attn 既有规则不变。
+
 ## 0.1.2
 
 - 升级为 prefetch guard v3，保留 `*args/**kwargs` 透传，兼容原生 H3 的 `malloc_scope="block"` 调用。
